@@ -3,19 +3,6 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-    <!-- GitHub Pages SPA Refresh Fix -->
-    <script>
-      (function(l){
-        if(l.search[1]==='/'){
-          var decoded=l.search.slice(1).split('&').map(function(s){
-            return s.replace(/~and~/g,'&');
-          }).join('?');
-          window.history.replaceState(null,null,
-            l.pathname.slice(0,-1)+decoded+(l.hash||'')
-          );
-        }
-      }(window.location));
-    </script>
     <!-- iOS smooth rendering -->
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -7989,15 +7976,20 @@
             if (!window.userData) return;
 
             // ===== 24-HOUR TASK RESET SYSTEM =====
-            // Task সব complete করার সময় থেকে ঠিক ২৪ ঘন্টা পর reset হবে (midnight নয়)
             const _now = Date.now();
             const _allDoneAt = window.userData.allTasksDoneAt;
             if (_allDoneAt && (_now - _allDoneAt) >= 24 * 60 * 60 * 1000) {
-                // ২৪ ঘন্টা পেরিয়ে গেছে — reset করো
+                // ✅ Atomic Firestore reset
                 window.userData.completedTasks = {};
                 window.userData.lastTaskDate = new Date().toDateString();
                 window.userData.allTasksDoneAt = null;
-                window.syncUserData();
+                if (window.auth && window.auth.currentUser) {
+                    import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js")
+                        .then(({ doc, updateDoc }) => updateDoc(
+                            doc(window.db, 'users', window.auth.currentUser.uid),
+                            { completedTasks: {}, allTasksDoneAt: null, lastTaskDate: new Date().toDateString() }
+                        )).catch(e => console.warn('Reset error:', e));
+                }
             }
 
             let totalTasks = window.userData.tasksCount || 5;
@@ -8185,16 +8177,25 @@
 
         function startCooldownTimers(resetTime) {
             if (window._cooldownInterval) clearInterval(window._cooldownInterval);
-            window._cooldownInterval = setInterval(() => {
+            window._cooldownInterval = setInterval(async () => {
                 const now = Date.now();
                 const diff = resetTime - now;
                 if (diff <= 0) {
                     clearInterval(window._cooldownInterval);
-                    // Reset tasks for new cycle
+                    // ✅ Atomic Firestore reset — race condition নেই
+                    try {
+                        if (window.auth && window.auth.currentUser) {
+                            const { doc, updateDoc } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                            await updateDoc(doc(window.db, 'users', window.auth.currentUser.uid), {
+                                completedTasks: {},
+                                allTasksDoneAt: null,
+                                lastTaskDate: new Date().toDateString()
+                            });
+                        }
+                    } catch(e) { console.warn('Task reset error:', e); }
                     window.userData.completedTasks = {};
                     window.userData.allTasksDoneAt = null;
                     window.userData.lastTaskDate = new Date().toDateString();
-                    window.syncUserData();
                     initTaskPage();
                     return;
                 }
@@ -8261,35 +8262,42 @@
                 if (document.hidden) {
                     userLeftPage = true;
                 } else if (userLeftPage && !timerDone) {
-                    // User returned before 5 seconds
+                    // ✅ User returned before timer done — cancel everything
                     userReturnedEarly = true;
                     clearInterval(adInterval);
+                    adInterval = null;
+                    document.removeEventListener('visibilitychange', adVisibilityHandler);
+                    adVisibilityHandler = null;
                     overlay.classList.remove('active');
                     setTimeout(() => { overlay.style.display = 'none'; }, 300);
-                    // Show early-exit warning
                     const warn = document.getElementById('warningModalOverlay');
                     warn.style.display = 'flex';
                     setTimeout(() => warn.classList.add('active'), 10);
-                    document.removeEventListener('visibilitychange', adVisibilityHandler);
                 }
             };
             document.addEventListener('visibilitychange', adVisibilityHandler);
 
             adInterval = setInterval(() => {
+                // ✅ Guard: যদি user early exit করে থাকে interval চলবে না
+                if (userReturnedEarly) { clearInterval(adInterval); return; }
                 adTimeLeft--;
                 document.getElementById('adOverlayTimer').innerText = adTimeLeft;
 
                 if (adTimeLeft <= 0) {
                     timerDone = true;
                     clearInterval(adInterval);
+                    adInterval = null;
                     document.removeEventListener('visibilitychange', adVisibilityHandler);
-                    finishAdSuccess();
+                    adVisibilityHandler = null;
+                    if (!userReturnedEarly) finishAdSuccess();
                 }
             }, 1000);
         };
 
         window.closeAdEarly = function() {
+            // ✅ Clean everything up
             clearInterval(adInterval);
+            adInterval = null;
             if (adVisibilityHandler) {
                 document.removeEventListener('visibilitychange', adVisibilityHandler);
                 adVisibilityHandler = null;
@@ -8299,6 +8307,8 @@
             setTimeout(() => overlay.style.display = 'none', 300);
 
             if (adTimeLeft > 0) {
+                // ✅ Reset lock so next task can start fresh
+                _adFinishLock = false;
                 const warn = document.getElementById('warningModalOverlay');
                 warn.style.display = 'flex';
                 setTimeout(() => warn.classList.add('active'), 10);
@@ -8481,10 +8491,25 @@
                 const newBalance = data.balance || 0;
 
                 // ✅ Merge fresh Firestore data into window.userData
-                // ⚠️ IMPORTANT: Do NOT overwrite task fields (completedTasks, taskEarnings, allTasksDoneAt)
-                // with potentially stale Firestore data — this causes balance to re-add on sync
+                // Task fields: Firestore এর value বেশি হলে সেটা নাও (secure), কম হলে local রাখো
+                const localCompleted = window.userData ? (window.userData.completedTasks || {}) : {};
+                const localTaskEarn = window.userData ? (window.userData.taskEarnings || 0) : 0;
+                const localAllDoneAt = window.userData ? (window.userData.allTasksDoneAt || null) : null;
+                const fsCompleted = data.completedTasks || {};
+                const fsTaskEarn = data.taskEarnings || 0;
+                // Merge completedTasks: local OR firestore (যেটায় বেশি tasks)
+                const mergedCompleted = Object.keys(localCompleted).length >= Object.keys(fsCompleted).length
+                    ? localCompleted : fsCompleted;
+                const mergedTaskEarn = Math.max(localTaskEarn, fsTaskEarn);
+                const mergedAllDoneAt = localAllDoneAt || data.allTasksDoneAt || null;
                 const { completedTasks, taskEarnings, allTasksDoneAt, ...safeData } = data;
-                window.userData = { ...window.userData, ...safeData };
+                window.userData = {
+                    ...window.userData,
+                    ...safeData,
+                    completedTasks: mergedCompleted,
+                    taskEarnings: mergedTaskEarn,
+                    allTasksDoneAt: mergedAllDoneAt
+                };
 
                 // ✅ If balance changed (admin approved deposit) → update UI and show toast
                 if (prevBalance !== null && newBalance !== prevBalance) {
@@ -8495,10 +8520,12 @@
                     }
                 }
 
-                // ✅ Re-render invest UI with latest Firestore data
+                // ✅ Re-render invest UI with latest Firestore data (only if tab is visible)
                 updateGlobalBalance();
-                if (typeof renderActiveInvestments === 'function') renderActiveInvestments();
-                if (typeof renderInvestHistory === 'function') renderInvestHistory();
+                const invTab = document.getElementById('invest-active-container');
+                if (invTab && typeof renderActiveInvestments === 'function') renderActiveInvestments();
+                const invHistTab = document.getElementById('invest-history-container');
+                if (invHistTab && typeof renderInvestHistory === 'function') renderInvestHistory();
                 if (typeof updateWalletUI === 'function') updateWalletUI();
 
                 // ✅ Check if any investment has matured (Firestore data এলেই check করো)
@@ -8706,7 +8733,9 @@
             widCalculateTotal();
         }
 
+        let _widProcessing = false; // ✅ Duplicate withdraw lock
         function widProcessWithdraw() {
+            if (_widProcessing) return; // ✅ Double-tap guard
             const amt = document.getElementById('wid-amount-input').value;
             if(!amt || amt <= 0) return showAlert("Please enter a valid amount.");
 
@@ -8730,6 +8759,7 @@
                 : document.getElementById('wid-pay-input').value;
             if (!widPayMethod || widPayMethod.trim() === '') return showAlert("Please Enter Pay ID/Email");
 
+            _widProcessing = true; // ✅ Lock
             document.querySelectorAll('.modal-wrap').forEach(m => m.classList.remove('open'));
 
             const loader = document.getElementById('loader');
@@ -8745,6 +8775,7 @@
                     if (!currentUser) {
                         loader.classList.remove('visible');
                         setTimeout(() => { loader.style.display = 'none'; }, 250);
+                        _widProcessing = false;
                         return showAlert("⚠️ Session expired. Please login again.");
                     }
 
@@ -8773,6 +8804,7 @@
 
                     // সব যাচাই পাশ — এখন transaction করো
                     // ✅ Transaction process করো (সার্ভার-verified balance দিয়ে)
+                    const now = new Date(); // ✅ Fix: now was missing → crash
                     const _platFee = parseFloat((amtVal * 0.05).toFixed(4));
                     const _netFee = (widActiveTab === 'crypto') ? parseFloat(widCurrentFee) : 0;
                     const _receiveAmt = Math.max(0, amtVal - _platFee - _netFee);
@@ -8849,6 +8881,8 @@
                     loader.classList.remove('visible');
                     setTimeout(() => { loader.style.display = 'none'; }, 250);
                     showAlert("⚠️ Transaction failed. Please try again.");
+                } finally {
+                    _widProcessing = false; // ✅ Always release lock
                 }
             }, 1500);
         }
@@ -9199,7 +9233,9 @@
         // ============================================================
         // MANUAL FALLBACK SUBMIT
         // ============================================================
+        let _depProcessing = false; // ✅ Duplicate deposit lock
         function depSubmitDeposit() {
+            if (_depProcessing) return; // ✅ Double-tap guard
             let amt, id, method, net;
             if(depActiveTab === 'crypto') {
                 if(!document.getElementById('dep-network-input').value) return showAlert('Please Select Network');
@@ -9219,6 +9255,7 @@
             if(parseFloat(amt) > 50000)  return showAlert('⚠️ Maximum deposit amount is $50,000.');
             if(!id)                      return showAlert('Please Enter Transaction ID / Sender Info');
 
+            _depProcessing = true; // ✅ Lock
             document.querySelectorAll('.modal-wrap').forEach(m => m.classList.remove('open'));
             const loader = document.getElementById('loader');
             loader.style.display = 'flex';
@@ -9257,6 +9294,7 @@
                 loader.classList.remove('visible');
                 showSuccessOverlay('depSuccessOverlay');
                 setTimeout(() => { loader.style.display = 'none'; }, 250);
+                _depProcessing = false; // ✅ Release lock
             }, 1500);
         }
 
@@ -9349,7 +9387,11 @@
             document.getElementById('inv-date-end').innerText = dateStr;
         }
 
+        let _investProcessing = false;
+
         function confirmInvest() {
+            if (_investProcessing) return;
+
             const amount = parseFloat(document.getElementById('inv-amount-input').value);
             const currentBal = window.userData ? window.userData.balance : 0;
 
@@ -9362,58 +9404,78 @@
                 return;
             }
 
+            _investProcessing = true;
             document.getElementById('investModal').classList.remove('open');
             const loader = document.getElementById('loader');
             loader.style.display = 'flex';
             setTimeout(() => loader.classList.add('visible'), 10);
 
             setTimeout(async () => {
-                loader.classList.remove('visible');
-                setTimeout(() => loader.style.display = 'none', 300);
-                
-                window.userData.balance -= amount;
-                
-                const dailyProfit = amount * (invSelectedRate / 100);
-                const totalProfit = dailyProfit * invSelectedDays;
-                const endTime = Date.now() + (invSelectedDays * 24 * 60 * 60 * 1000); 
+                try {
+                    loader.classList.remove('visible');
+                    setTimeout(() => loader.style.display = 'none', 300);
 
-                const newInv = {
-                    id: Date.now(),
-                    amount: amount,
-                    days: invSelectedDays,
-                    rate: invSelectedRate,
-                    totalProfit: totalProfit,
-                    startTime: Date.now(),
-                    endTime: endTime
-                };
+                    const { getDoc, doc, updateDoc } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                    const freshSnap = await getDoc(doc(window.db, 'users', window.auth.currentUser.uid));
+                    if (!freshSnap.exists()) { _investProcessing = false; return; }
+                    const freshBal = parseFloat(freshSnap.data().balance || 0);
 
-                if (!window.userData.activeInvestments) window.userData.activeInvestments = [];
-                window.userData.activeInvestments.push(newInv);
+                    if (amount > freshBal) {
+                        showAlert(`Insufficient Balance! Available: ${freshBal.toFixed(2)}`);
+                        _investProcessing = false;
+                        return;
+                    }
 
-                // Invest History save করো
-                if (!window.userData.investHistory) window.userData.investHistory = [];
-                window.userData.investHistory.unshift({
-                    id: newInv.id,
-                    amount: amount,
-                    days: invSelectedDays,
-                    rate: invSelectedRate,
-                    totalProfit: totalProfit,
-                    status: 'active',
-                    date: new Date().toISOString()
-                });
-                await window.syncUserData();
+                    const startTime = Date.now();
+                    const dailyProfit = parseFloat((amount * (invSelectedRate / 100)).toFixed(6));
+                    const totalProfit = parseFloat((dailyProfit * invSelectedDays).toFixed(6));
+                    const endTime = startTime + (invSelectedDays * 24 * 60 * 60 * 1000);
 
-                updateGlobalBalance();
-                renderActiveInvestments();
+                    const newInv = {
+                        id: startTime,
+                        amount: amount,
+                        days: invSelectedDays,
+                        rate: invSelectedRate,
+                        dailyProfit: dailyProfit,
+                        totalProfit: totalProfit,
+                        startTime: startTime,
+                        endTime: endTime
+                    };
 
-                confetti({
-                    particleCount: 80,
-                    spread: 60,
-                    origin: { y: 0.6 },
-                    colors:['#d4af37', '#ffd700']
-                });
-                
-                showAlert("Subscription Successful! Assets Locked.");
+                    const currentInvs = freshSnap.data().activeInvestments || [];
+                    const currentHist = freshSnap.data().investHistory || [];
+                    const newBal = parseFloat((freshBal - amount).toFixed(2));
+
+                    const histEntry = {
+                        id: startTime, amount, days: invSelectedDays,
+                        rate: invSelectedRate, dailyProfit, totalProfit,
+                        startTime, endTime, status: 'active',
+                        date: new Date().toISOString()
+                    };
+
+                    await updateDoc(doc(window.db, 'users', window.auth.currentUser.uid), {
+                        balance: newBal,
+                        activeInvestments: [...currentInvs, newInv],
+                        investHistory: [histEntry, ...currentHist]
+                    });
+
+                    window.userData.balance = newBal;
+                    window.userData.activeInvestments = [...currentInvs, newInv];
+                    window.userData.investHistory = [histEntry, ...(window.userData.investHistory || [])];
+
+                    updateGlobalBalance();
+                    renderActiveInvestments();
+                    renderInvestHistory();
+
+                    confetti({ particleCount: 80, spread: 60, origin: { y: 0.6 }, colors: ['#d4af37', '#ffd700'] });
+                    showAlert(`Subscription Successful!\nLocked: $${amount.toFixed(2)} | Daily: +$${dailyProfit.toFixed(4)} | Total Profit: +$${totalProfit.toFixed(4)}`);
+
+                } catch(e) {
+                    console.error('Investment error:', e);
+                    showAlert('Investment failed. Please try again.');
+                } finally {
+                    _investProcessing = false;
+                }
             }, 1500);
         }
 
@@ -10925,20 +10987,29 @@
         async function showSpinRewardModal(reward) {
             document.getElementById('spinRewardText').innerText = reward;
             document.getElementById('spinRewardOverlay').classList.add('active');
-            // Balance add + spinUsed = true Firebase save
+            // ✅ Fix: single atomic Firestore write — no double sync
             try {
                 const rewardAmt = parseFloat(reward.replace('$','')) || 0;
                 if (rewardAmt > 0 && window.userData && window.auth && window.auth.currentUser) {
-                    window.userData.balance = (window.userData.balance || 0) + rewardAmt;
+                    const { doc, getDoc, updateDoc } = await import("https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore.js");
+                    const uid = window.auth.currentUser.uid;
+                    const snap = await getDoc(doc(window.db, 'users', uid));
+                    if (!snap.exists()) return;
+                    const fresh = snap.data();
+                    const newBalance = parseFloat(((fresh.balance || 0) + rewardAmt).toFixed(4));
+                    const spinHistory = Array.isArray(fresh.spinHistory) ? [...fresh.spinHistory] : [];
+                    spinHistory.unshift({ reward: rewardAmt, date: new Date().toISOString() });
+                    // ✅ Single atomic write
+                    await updateDoc(doc(window.db, 'users', uid), {
+                        balance: newBalance,
+                        spinUsed: true,
+                        spinHistory: spinHistory
+                    });
+                    window.userData.balance = newBalance;
                     window.userData.spinUsed = true;
+                    window.userData.spinHistory = spinHistory;
                     isSpinUnlocked = false;
-                    await window.syncUserData();
                     updateGlobalBalance();
-                    // Notify referrer — spin bonus earned
-                    // Add to user's spin history
-                    if (!window.userData.spinHistory) window.userData.spinHistory = [];
-                    window.userData.spinHistory.unshift({ reward: rewardAmt, date: new Date().toISOString() });
-                    await window.syncUserData();
                 }
             } catch(e) { console.warn('Spin reward save error:', e); }
         }
